@@ -34,6 +34,16 @@ from denoising_diffusion_pytorch.version import __version__
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
+### my modification
+import matplotlib.pyplot as plt
+import numpy as np
+
+inspect_mode = True
+
+def inspect(*args):
+    if inspect_mode:
+        print(*args)
+
 # helpers functions
 
 def exists(x):
@@ -160,6 +170,7 @@ class Block(nn.Module):
         x = self.act(x)
         return x
 
+
 class ResnetBlock(nn.Module):
     def __init__(self, dim, dim_out, *, time_emb_dim = None, groups = 8):
         super().__init__()
@@ -267,6 +278,18 @@ class Attention(nn.Module):
         out = rearrange(out, 'b h (x y) d -> b (h d) x y', x = h, y = w)
         return self.to_out(out)
 
+
+class ClassCondEmb(nn.Module):
+    """
+    Class condition embedding: used to turn a class index into an embedding
+    """
+    def __init__(self, x_shape):
+        super().__init__()
+
+    def forward(self, x):
+        emb = 1
+        return emb
+
 # model
 
 class Unet(nn.Module):
@@ -287,7 +310,8 @@ class Unet(nn.Module):
         attn_dim_head = 32,
         attn_heads = 4,
         full_attn = None,    # defaults to full attention only for inner most layer
-        flash_attn = False
+        flash_attn = False,
+        class_condition = False,
     ):
         super().__init__()
 
@@ -295,6 +319,7 @@ class Unet(nn.Module):
 
         self.channels = channels
         self.self_condition = self_condition
+        self.class_condition = class_condition  # use class condition to generate specific samples belonged to a certain class
         input_channels = channels * (2 if self_condition else 1)
 
         init_dim = default(init_dim, dim)
@@ -384,12 +409,16 @@ class Unet(nn.Module):
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
 
-    def forward(self, x, time, x_self_cond = None):
+    def forward(self, x, time, x_self_cond = None, class_cond = None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
+
+        if self.class_condition:
+            class_cond_emb = class_embedder(class_cond, x.shape)
+            x = torch.cat((class_cond_emd, x), dim = 1)
 
         x = self.init_conv(x)
         r = x.clone()
@@ -767,8 +796,15 @@ class GaussianDiffusion(nn.Module):
 
     def p_losses(self, x_start, t, noise = None, offset_noise_strength = None):
         b, c, h, w = x_start.shape
-
+        inspect("# in p_losses, input is an image", b, c, h, w)
+        if noise is not None:
+            inspect("noise is not None")
+        else:
+            inspect("noise is none, auto set to random val")
         noise = default(noise, lambda: torch.randn_like(x_start))
+
+        plt.imshow(np.transpose(noise[0], (1, 2, 0)))
+        plt.show()
 
         # offset noise - https://www.crosslabs.org/blog/diffusion-with-offset-noise
 
@@ -779,9 +815,13 @@ class GaussianDiffusion(nn.Module):
             noise += offset_noise_strength * rearrange(offset_noise, 'b c -> b c 1 1')
 
         # noise sample
-
+        inspect("before going to q_sample, x is:")
+        plt.imshow(np.transpose(x_start[0], (1, 2, 0)))
+        plt.show()
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
-
+        inspect(f"after q_sample for t = {t[0]}, x is:")
+        plt.imshow(np.transpose(x[0], (1, 2, 0)))
+        plt.show()
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
         # and condition with unet with that
         # this technique will slow down training by 25%, but seems to lower FID significantly
@@ -793,8 +833,11 @@ class GaussianDiffusion(nn.Module):
                 x_self_cond.detach_()
 
         # predict and take gradient step
-
+        inspect("going to predict using model")
         model_out = self.model(x, t, x_self_cond)
+        inspect("after model_prediction, model_out:", model_out.shape)
+        plt.imshow(np.transpose(x[0], (1, 2, 0)))
+        plt.show()
 
         if self.objective == 'pred_noise':
             target = noise
@@ -814,9 +857,10 @@ class GaussianDiffusion(nn.Module):
 
     def forward(self, img, *args, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
+        inspect("# in forward", b, c, h, w, device, img_size)
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-
+        inspect("t is ", t, t.shape)
         img = self.normalize(img)
         return self.p_losses(img, t, *args, **kwargs)
 
