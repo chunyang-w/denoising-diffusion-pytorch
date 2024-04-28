@@ -34,6 +34,16 @@ from denoising_diffusion_pytorch.version import __version__
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
+### my modification
+import matplotlib.pyplot as plt
+import numpy as np
+
+inspect_mode = False
+
+def inspect(*args):
+    if inspect_mode:
+        print(*args)
+
 # helpers functions
 
 def exists(x):
@@ -160,6 +170,7 @@ class Block(nn.Module):
         x = self.act(x)
         return x
 
+
 class ResnetBlock(nn.Module):
     def __init__(self, dim, dim_out, *, time_emb_dim = None, groups = 8):
         super().__init__()
@@ -267,6 +278,62 @@ class Attention(nn.Module):
         out = rearrange(out, 'b h (x y) d -> b (h d) x y', x = h, y = w)
         return self.to_out(out)
 
+
+class CondEmbedder(nn.Module):
+    """
+    Condition embedding: used to turn a input into a tensor
+    input should be of size (batch, feat)
+    oupt put shape (batch, dim_embed, img_size, img_size)
+    """
+    def __init__(self, in_dim, emb_dim=1, img_size=None):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.img_size = img_size
+        self.out_dim = img_size * img_size * emb_dim
+        self.fc = nn.Linear(in_dim, self.out_dim)
+        self.act = nn.SiLU()
+        self.final = nn.Linear(self.out_dim, self.out_dim)
+
+    def forward(self, x):
+        x = self.fc(x)
+        x= self.act(x)
+        x = self.final(x)
+        x = x.reshape(-1, self.emb_dim, self.img_size, self.img_size)
+        return x
+
+class CondFilter(nn.Module):
+    """
+    Embedding Filter: used to turn a tensor into a tensor
+    input should be of size (batch, in_dim, img_size, img_size)
+    oupt put shape (batch, out_dim, img_size, img_size)
+    """
+    def __init__(self, in_dim, emb_dim=1, img_size=None, out_img_size=None):
+        super().__init__()
+        self.in_dim = in_dim
+        self.emb_dim = emb_dim
+        self.img_size = img_size
+        self.out_img_size = int(out_img_size)
+
+        self.in_size = in_dim * img_size * img_size
+        self.out_size = int(emb_dim * out_img_size * out_img_size)
+        # print("in CondFilter", in_dim, self.out_size)
+        self.fc = nn.Linear(self.in_size, self.out_size)
+        self.act = nn.SiLU()
+        self.final = nn.Linear(self.out_size, self.out_size)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        # print("In CondFilter", x.shape)
+        # print(self.in_size, self.out_size)
+        x = x.reshape(b, -1)
+        x = self.fc(x)
+        x = self.act(x)
+        x = self.final(x)
+        x = x.reshape(b, -1, self.out_img_size, self.out_img_size)
+
+        return x
+
+
 # model
 
 class Unet(nn.Module):
@@ -287,7 +354,11 @@ class Unet(nn.Module):
         attn_dim_head = 32,
         attn_heads = 4,
         full_attn = None,    # defaults to full attention only for inner most layer
-        flash_attn = False
+        flash_attn = False,
+        use_condition = False,
+        image_size = None,
+        cond_dim = 1,  # initial dimension for input embedding
+        cond_emb_dim = 16,  # the dimension (channel) for condition filters
     ):
         super().__init__()
 
@@ -295,15 +366,24 @@ class Unet(nn.Module):
 
         self.channels = channels
         self.self_condition = self_condition
+        self.use_condition = use_condition  # use class condition to generate specific samples belonged to a certain class
+        self.image_size = image_size
+        self.cond_dim = cond_dim
+        self.cond_emb_dim = cond_emb_dim
         input_channels = channels * (2 if self_condition else 1)
 
         init_dim = default(init_dim, dim)
-        self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding = 3)
+        self.init_conv = nn.Conv2d(input_channels + (self.cond_dim if self.use_condition else 0), init_dim, 7, padding = 3)
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
+        inspect("dims = ", dims)
+        inspect("in Unet init, in_out is", in_out)
 
         block_klass = partial(ResnetBlock, groups = resnet_block_groups)
+
+        if self.use_condition and self.image_size is not None:
+            self.cond_embedder = CondEmbedder(in_dim=1, emb_dim=1, img_size=self.image_size)
 
         # time embeddings
 
@@ -345,34 +425,42 @@ class Unet(nn.Module):
         self.ups = nn.ModuleList([])
         num_resolutions = len(in_out)
 
-        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(in_out, full_attn, attn_heads, attn_dim_head)):
+        out_img_size = self.image_size
+        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(
+            zip(in_out, full_attn, attn_heads, attn_dim_head)):
             is_last = ind >= (num_resolutions - 1)
 
             attn_klass = FullAttention if layer_full_attn else LinearAttention
 
             self.downs.append(nn.ModuleList([
-                block_klass(dim_in, dim_in, time_emb_dim = time_dim),
+                CondFilter(self.cond_dim, self.cond_emb_dim, self.image_size, out_img_size),
+                block_klass(dim_in + self.cond_emb_dim if self.use_condition else 0 , dim_in, time_emb_dim = time_dim),
                 block_klass(dim_in, dim_in, time_emb_dim = time_dim),
                 attn_klass(dim_in, dim_head = layer_attn_dim_head, heads = layer_attn_heads),
                 Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 3, padding = 1)
             ]))
+            out_img_size /= 2 if (ind != len(in_out) - 1) else 1
 
         mid_dim = dims[-1]
-        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
+        self.mid_cond_filter = CondFilter(self.cond_dim, self.cond_emb_dim, self.image_size, out_img_size)
+        self.mid_block1 = block_klass(mid_dim + self.cond_emb_dim if self.use_condition else 0, mid_dim, time_emb_dim = time_dim)
         self.mid_attn = FullAttention(mid_dim, heads = attn_heads[-1], dim_head = attn_dim_head[-1])
         self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
 
-        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(*map(reversed, (in_out, full_attn, attn_heads, attn_dim_head)))):
+        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(
+            zip(*map(reversed, (in_out, full_attn, attn_heads, attn_dim_head)))):
             is_last = ind == (len(in_out) - 1)
 
             attn_klass = FullAttention if layer_full_attn else LinearAttention
 
             self.ups.append(nn.ModuleList([
-                block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim),
+                CondFilter(self.cond_dim, self.cond_emb_dim, self.image_size, out_img_size),
+                block_klass(dim_out + dim_in + self.cond_emb_dim if self.use_condition else 0, dim_out, time_emb_dim = time_dim),
                 block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim),
                 attn_klass(dim_out, dim_head = layer_attn_dim_head, heads = layer_attn_heads),
                 Upsample(dim_out, dim_in) if not is_last else  nn.Conv2d(dim_out, dim_in, 3, padding = 1)
             ]))
+            out_img_size *= 2
 
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, default_out_dim)
@@ -384,12 +472,21 @@ class Unet(nn.Module):
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
 
-    def forward(self, x, time, x_self_cond = None):
+    def forward(self, x, time, x_self_cond = None, cond = None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
+        # print("input x shape before embed", x.shape)
+        if self.use_condition and cond is not None:
+            cond = cond[:, None]
+            cond_embed = self.cond_embedder(cond) # TODO: here we define the cond_embd for furter embedding
+            x = torch.concat((x, cond_embed), dim = 1)
+
+        # print("cond_embd", cond_embed.shape)
+        # print("input x shape after embed", x.shape)
+        # print("input cond shape", cond.shape)
 
         x = self.init_conv(x)
         r = x.clone()
@@ -398,7 +495,12 @@ class Unet(nn.Module):
 
         h = []
 
-        for block1, block2, attn, downsample in self.downs:
+        for cond_filter, block1, block2, attn, downsample in self.downs:
+            # print(cnt, "x shape", x.shape)
+            ce = cond_filter(cond_embed) # TODO: ce = short for condition embedding
+            # print("in Unet forward down", x.shape, ce.shape)
+            x = torch.concat((x, ce), dim = 1)
+
             x = block1(x, t)
             h.append(x)
 
@@ -408,11 +510,18 @@ class Unet(nn.Module):
 
             x = downsample(x)
 
+        ce = self.mid_cond_filter(cond_embed)
+        x = torch.concat((x, ce), dim = 1)
         x = self.mid_block1(x, t)
         x = self.mid_attn(x) + x
         x = self.mid_block2(x, t)
 
-        for block1, block2, attn, upsample in self.ups:
+        for cond_filter, block1, block2, attn, upsample in self.ups:
+            # print(cnt, "up, x shape", x.shape)
+            ce = cond_filter(cond_embed)
+            # print("in Unet forward up", x.shape, ce.shape)
+            x = torch.concat((x, ce), dim = 1)
+
             x = torch.cat((x, h.pop()), dim = 1)
             x = block1(x, t)
 
@@ -485,7 +594,8 @@ class GaussianDiffusion(nn.Module):
         auto_normalize = True,
         offset_noise_strength = 0.,  # https://www.crosslabs.org/blog/diffusion-with-offset-noise
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
-        min_snr_gamma = 5
+        min_snr_gamma = 5,
+        use_condition = False,
     ):
         super().__init__()
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
@@ -495,6 +605,7 @@ class GaussianDiffusion(nn.Module):
 
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
+        self.use_condition = use_condition
 
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
@@ -625,8 +736,9 @@ class GaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        model_output = self.model(x, t, x_self_cond)
+    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False, cond = None):
+        model_output = self.model(x, t, x_self_cond, cond = cond)
+
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -650,8 +762,8 @@ class GaussianDiffusion(nn.Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, x_self_cond)
+    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True, cond=None):
+        preds = self.model_predictions(x, t, x_self_cond, cond=cond)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -661,16 +773,16 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.inference_mode()
-    def p_sample(self, x, t: int, x_self_cond = None):
+    def p_sample(self, x, t: int, x_self_cond = None, cond=None):
         b, *_, device = *x.shape, self.device
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True, cond=cond)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, return_all_timesteps = False):
+    def p_sample_loop(self, shape, return_all_timesteps = False, cond=None):
         batch, device = shape[0], self.device
 
         img = torch.randn(shape, device = device)
@@ -680,7 +792,7 @@ class GaussianDiffusion(nn.Module):
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond)
+            img, x_start = self.p_sample(img, t, self_cond, cond = cond)
             imgs.append(img)
 
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
@@ -731,10 +843,10 @@ class GaussianDiffusion(nn.Module):
         return ret
 
     @torch.inference_mode()
-    def sample(self, batch_size = 16, return_all_timesteps = False):
+    def sample(self, batch_size = 16, return_all_timesteps = False, cond = None):
         (h, w), channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps)
+        return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps, cond = cond)
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -765,10 +877,18 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None):
+    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None, cond = None):
+        cond = None if not self.use_condition else cond
         b, c, h, w = x_start.shape
-
+        inspect("# in p_losses, input is an image", b, c, h, w)
+        if noise is not None:
+            inspect("noise is not None")
+        else:
+            inspect("noise is none, auto set to random val")
         noise = default(noise, lambda: torch.randn_like(x_start))
+
+        # plt.imshow(np.transpose(noise[0].cpu(), (1, 2, 0)))
+        # plt.show()
 
         # offset noise - https://www.crosslabs.org/blog/diffusion-with-offset-noise
 
@@ -779,9 +899,13 @@ class GaussianDiffusion(nn.Module):
             noise += offset_noise_strength * rearrange(offset_noise, 'b c -> b c 1 1')
 
         # noise sample
-
+        inspect("before going to q_sample, x is:")
+        # plt.imshow(np.transpose(x_start[0].cpu(), (1, 2, 0)))
+        # plt.show()
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
-
+        inspect(f"after q_sample for t = {t[0]}, x is:")
+        # plt.imshow(np.transpose(x[0].cpu(), (1, 2, 0)))
+        # plt.show()
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
         # and condition with unet with that
         # this technique will slow down training by 25%, but seems to lower FID significantly
@@ -789,12 +913,15 @@ class GaussianDiffusion(nn.Module):
         x_self_cond = None
         if self.self_condition and random() < 0.5:
             with torch.no_grad():
-                x_self_cond = self.model_predictions(x, t).pred_x_start
+                x_self_cond = self.model_predictions(x, t, cond = cond).pred_x_start
                 x_self_cond.detach_()
 
         # predict and take gradient step
-
-        model_out = self.model(x, t, x_self_cond)
+        inspect("going to predict using model")
+        model_out = self.model(x, t, x_self_cond, cond = cond)
+        inspect("after model_prediction, model_out:", model_out.shape)
+        # plt.imshow(np.transpose(x[0].cpu(), (1, 2, 0)))
+        # plt.show()
 
         if self.objective == 'pred_noise':
             target = noise
@@ -814,9 +941,10 @@ class GaussianDiffusion(nn.Module):
 
     def forward(self, img, *args, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
+        inspect("# in forward", b, c, h, w, device, img_size)
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-
+        inspect("t is ", t, t.shape)
         img = self.normalize(img)
         return self.p_losses(img, t, *args, **kwargs)
 
